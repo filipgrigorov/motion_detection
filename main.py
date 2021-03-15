@@ -34,7 +34,7 @@ def estimate_depth(depth_roi, extremes=[MIN_DEPTH, MAX_DEPTH]):
     return nbins[max_idx] + MIN_DEPTH
 
 class MotionDetection:
-    def __init__(self, h, w, grid_size, l=10):
+    def __init__(self, h, w, grid_size, l=20):
         self.h = h
         self.w = w
         self.grid = grid_size
@@ -44,8 +44,6 @@ class MotionDetection:
         self.gw = w // grid_size
 
         print(f'Grid: {self.gh} x {self.gw}')
-
-        self.map = np.zeros((self.h, self.w)).astype(np.uint16)
 
         self.history = deque(maxlen=l)
 
@@ -64,29 +62,38 @@ class MotionDetection:
     # Discount only absdiffs that meet the thresh criteria
 
     def detect(self, frame):
+        depth_map = np.zeros((self.h, self.w)).astype(np.uint16)
         if len(self.history) == 0:
             for row in range(0, self.h - self.grid, self.grid):
                 for col in range(0, self.w - self.grid, self.grid):
-                    self.map[row : row + self.grid, col : col + self.grid] = estimate_depth(frame[row : row + self.grid, col : col + self.grid])
-                    self.history.append((frame, np.abs(frame - frame)))
-            return self.mask
+                    depth_map[row : row + self.grid, col : col + self.grid] = estimate_depth(frame[row : row + self.grid, col : col + self.grid])
 
-        absdiff = np.abs(self.history[-1][1] - frame)
-        self.history.append((frame, absdiff))
+            absdiff = np.abs(depth_map - depth_map)
+            self.history.append((depth_map, absdiff))
+
+            return absdiff, copy.deepcopy(depth_map)
+
+        # Construct current map
+        for row in range(0, self.h - self.grid, self.grid):
+            for col in range(0, self.w - self.grid, self.grid):
+                depth_map[row : row + self.grid, col : col + self.grid] = estimate_depth(frame[row : row + self.grid, col : col + self.grid])
+
+        # Construct the absolute frame difference
+        absdiff = np.abs(self.history[-1][0] - depth_map)
+        self.history.append((depth_map, absdiff))
 
         for row in range(0, self.h - self.grid, self.grid):
             for col in range(0, self.w - self.grid, self.grid):
-                superpixel = np.zeros((self.grid, self.grid))
+                superpixel = np.zeros((self.grid, self.grid)).astype(np.float32)
+                # Make stats on the history of this superpixel (moving average and variance -> remove spurious motion detections)
                 for idx in range(0, len(self.history)):
-                    historical_superpixel = self.history[idx][1][row : row + self.grid, col : col + self.grid]
-                    superpixel += (self.gamma ** idx) * historical_superpixel
+                    avg_superpixel = self.history[idx][1][row : row + self.grid, col : col + self.grid]
+                    superpixel += (self.gamma ** idx) * avg_superpixel
                 superpixel /= len(self.history)
-                superpixel /= np.max(superpixel)
 
-                if estimate_depth(superpixel) > THRESH:
-                    self.mask[row : row + self.grid, col : col + self.grid] = superpixel[...] * 255
+                self.mask[row : row + self.grid, col : col + self.grid] = 255 if np.uint16(estimate_depth(superpixel)) > THRESH else 0
 
-        return self.mask
+        return absdiff, copy.deepcopy(depth_map)
 
 if __name__ == '__main__':
     print("Start")
@@ -130,14 +137,14 @@ if __name__ == '__main__':
         rgb_np = np.ascontiguousarray(rgb_rs.as_frame().get_data(), dtype=np.uint8)
         depth_np = np.ascontiguousarray(depth_rs.as_frame().get_data(), dtype=np.uint16)
 
-        mask = det.detect(depth_np)
+        mask, depth_map = det.detect(depth_np)
         
         # Render grid on top of the RGB
-        [ cv2.line(depth_np, (0, row), (cols - 1, row), (65000, 65000, 65000), 1) for row in range(0, rows, grid) ]
-        [ cv2.line(depth_np, (col, 0), (col, rows - 1), (65000, 65000, 65000), 1) for col in range(0, cols, grid) ]
+        [ cv2.line(depth_map, (0, row), (cols - 1, row), (65000, 65000, 65000), 1) for row in range(0, rows, grid) ]
+        [ cv2.line(depth_map, (col, 0), (col, rows - 1), (65000, 65000, 65000), 1) for col in range(0, cols, grid) ]
 
         cv2.imshow('MASK', mask)
-        cv2.imshow('DEPTH', depth_np.astype(np.uint16))
+        cv2.imshow('DEPTH', depth_map.astype(np.uint16))
 
         key = cv2.waitKey(1)
         if key & 0xFF == ord('q') or key == 27:
