@@ -15,7 +15,7 @@ fps = 30
 MIN_DEPTH = 300
 MAX_DEPTH = 4000
 
-THRESH = 30
+THRESH = 10
 
 def mode(frame):
     return stats.mode(frame).mode[0][0]
@@ -46,9 +46,6 @@ class MotionDetection:
         print(f'Grid: {self.gh} x {self.gw}')
 
         self.history = deque(maxlen=l)
-
-        self.mask = np.zeros((h, w)).astype(np.uint8)
-
         self.gamma = 0.9
 
     # If the centroid of the depth has moved, or the average depth has changed per superpixel, we have motion
@@ -62,21 +59,24 @@ class MotionDetection:
     # Discount only absdiffs that meet the thresh criteria
 
     def detect(self, frame):
+        mask = np.zeros((self.h, self.w)).astype(np.uint8)
         depth_map = np.zeros((self.h, self.w)).astype(np.uint16)
         if len(self.history) == 0:
             for row in range(0, self.h - self.grid, self.grid):
                 for col in range(0, self.w - self.grid, self.grid):
-                    depth_map[row : row + self.grid, col : col + self.grid] = estimate_depth(frame[row : row + self.grid, col : col + self.grid])
+                    depth_map[row : row + self.grid, col : col + self.grid] = \
+                        max(min(estimate_depth(frame[row : row + self.grid, col : col + self.grid]), MAX_DEPTH), MIN_DEPTH)
 
             absdiff = np.abs(depth_map - depth_map)
             self.history.append((depth_map, absdiff))
 
-            return absdiff, copy.deepcopy(depth_map)
+            return mask, copy.deepcopy(depth_map)
 
         # Construct current map
         for row in range(0, self.h - self.grid, self.grid):
             for col in range(0, self.w - self.grid, self.grid):
-                depth_map[row : row + self.grid, col : col + self.grid] = estimate_depth(frame[row : row + self.grid, col : col + self.grid])
+                depth_map[row : row + self.grid, col : col + self.grid] = \
+                    max(min(estimate_depth(frame[row : row + self.grid, col : col + self.grid]), MAX_DEPTH), MIN_DEPTH)
 
         # Construct the absolute frame difference
         absdiff = np.abs(self.history[-1][0] - depth_map)
@@ -84,16 +84,19 @@ class MotionDetection:
 
         for row in range(0, self.h - self.grid, self.grid):
             for col in range(0, self.w - self.grid, self.grid):
-                superpixel = np.zeros((self.grid, self.grid)).astype(np.float32)
+                depths = []
                 # Make stats on the history of this superpixel (moving average and variance -> remove spurious motion detections)
+                mean_depth = 0.0
                 for idx in range(0, len(self.history)):
-                    avg_superpixel = self.history[idx][1][row : row + self.grid, col : col + self.grid]
-                    superpixel += (self.gamma ** idx) * avg_superpixel
-                superpixel /= len(self.history)
+                    depths.append(estimate_depth(self.history[idx][1][row : row + self.grid, col : col + self.grid]))
+                    mean_depth += (self.gamma ** idx) * depths[-1]
+                mean_depth /= len(self.history)
 
-                self.mask[row : row + self.grid, col : col + self.grid] = 255 if np.uint16(estimate_depth(superpixel)) > THRESH else 0
+                stddev = np.sqrt(np.sum([ (depth - mean_depth) ** 2 for depth in depths ])) / len(depths)
 
-        return absdiff, copy.deepcopy(depth_map)
+                mask[row : row + self.grid, col : col + self.grid] = 255 if mean_depth > THRESH and stddev < 50 else 0
+
+        return mask, copy.deepcopy(depth_map)
 
 if __name__ == '__main__':
     print("Start")
