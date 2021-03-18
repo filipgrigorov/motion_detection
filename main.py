@@ -58,6 +58,8 @@ class MotionDetection:
     # Motion is defined if the varinace of the motion is big enough and if the motion diff pixels themselves > threshold
     # Discount only absdiffs that meet the thresh criteria
 
+    # Let is try to do it with point map
+
     def detect(self, frame):
         mask = np.zeros((self.h, self.w)).astype(np.uint8)
         depth_map = np.zeros((self.h, self.w)).astype(np.uint16)
