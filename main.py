@@ -6,7 +6,21 @@ import pyrealsense2 as rs2
 
 from collections import deque
 from scipy import stats
-#from skimage.transform.integral import integral_image
+from skimage.transform.integral import integral_image
+
+'''
+If the centroid of the depth has moved, or the average depth has changed per superpixel, we have motion
+Check moving average of the superpixel's average depth:
+(i) If there is a lot of variance acros the history, then, it might be sporadic (depth defect)
+(ii) If the moving average has changed relative to the previous frames, with low variance, motion perhaps???
+(iii) Check the difference in depth values as well (absolute difference) -> After (i), (ii) and (iii) update the background
+
+If we have N no motion frames, create a background
+Motion is defined if the varinace of the motion is big enough and if the motion diff pixels themselves > threshold
+Discount only absdiffs that meet the thresh criteria
+
+# Note: Let is try to do it with point map
+'''
 
 rgb_size = (1920, 1080)
 depth_size = (1280, 720)
@@ -16,6 +30,7 @@ MIN_DEPTH = 300
 MAX_DEPTH = 4000
 
 THRESH = 10
+NOMOTIONTHRESH = 8
 
 def mode(frame):
     return stats.mode(frame).mode[0][0]
@@ -33,8 +48,12 @@ def estimate_depth(depth_roi, extremes=[MIN_DEPTH, MAX_DEPTH]):
 
     return nbins[max_idx] + MIN_DEPTH
 
+'''def estimate_depth(frame):
+    integral = integral_image(frame)
+    return integral[int() : ]'''
+
 class MotionDetection:
-    def __init__(self, h, w, grid_size, l=20):
+    def __init__(self, h, w, grid_size, l=10):
         self.h = h
         self.w = w
         self.grid = grid_size
@@ -48,57 +67,62 @@ class MotionDetection:
         self.history = deque(maxlen=l)
         self.gamma = 0.9
 
-    # If the centroid of the depth has moved, or the average depth has changed per superpixel, we have motion
-    # Check moving average of the superpixel's average depth:
-    # (i) If there is a lot of variance acros the history, then, it might be sporadic (depth defect)
-    # (ii) If the moving average has changed relative to the previous frames, with low variance, motion perhaps???
-    # (iii) Check the difference in depth values as well (absolute difference) -> After (i), (ii) and (iii) update the background
+        self.no_motion_count = 0
+        self.background = np.zeros((self.h, self.w)).astype(np.uint16)
 
-    # If we have N no motion frames, create a background
-    # Motion is defined if the varinace of the motion is big enough and if the motion diff pixels themselves > threshold
-    # Discount only absdiffs that meet the thresh criteria
-
-    # Let is try to do it with point map
+        self.prev = np.zeros((self.h, self.w)).astype(np.uint16)
 
     def detect(self, frame):
         mask = np.zeros((self.h, self.w)).astype(np.uint8)
         depth_map = np.zeros((self.h, self.w)).astype(np.uint16)
+        
         if len(self.history) == 0:
-            for row in range(0, self.h - self.grid, self.grid):
-                for col in range(0, self.w - self.grid, self.grid):
+            for row in range(0, self.h - self.grid + 1, self.grid):
+                for col in range(0, self.w - self.grid + 1, self.grid):
                     depth_map[row : row + self.grid, col : col + self.grid] = \
                         max(min(estimate_depth(frame[row : row + self.grid, col : col + self.grid]), MAX_DEPTH), MIN_DEPTH)
+            
+            self.background = depth_map
 
-            absdiff = np.abs(depth_map - depth_map)
+            absdiff = np.abs(depth_map - self.background)
+
             self.history.append((depth_map, absdiff))
 
             return mask, copy.deepcopy(depth_map)
 
         # Construct current map
-        for row in range(0, self.h - self.grid, self.grid):
-            for col in range(0, self.w - self.grid, self.grid):
+        for row in range(0, self.h - self.grid + 1, self.grid):
+            for col in range(0, self.w - self.grid + 1, self.grid):
                 depth_map[row : row + self.grid, col : col + self.grid] = \
                     max(min(estimate_depth(frame[row : row + self.grid, col : col + self.grid]), MAX_DEPTH), MIN_DEPTH)
 
-        # Construct the absolute frame difference
-        absdiff = np.abs(self.history[-1][0] - depth_map)
+        absdiff = np.abs(depth_map - self.background)
         self.history.append((depth_map, absdiff))
 
-        for row in range(0, self.h - self.grid, self.grid):
-            for col in range(0, self.w - self.grid, self.grid):
-                depths = []
-                # Make stats on the history of this superpixel (moving average and variance -> remove spurious motion detections)
-                mean_depth = 0.0
-                for idx in range(0, len(self.history)):
-                    depths.append(estimate_depth(self.history[idx][1][row : row + self.grid, col : col + self.grid]))
-                    mean_depth += (self.gamma ** idx) * depths[-1]
-                mean_depth /= len(self.history)
+        for row in range(0, self.h - self.grid + 1, self.grid):
+            for col in range(0, self.w - self.grid + 1, self.grid):
 
-                stddev = np.sqrt(np.sum([ (depth - mean_depth) ** 2 for depth in depths ])) / len(depths)
+                cell = absdiff[row : row + self.grid, col : col + self.grid]
 
-                mask[row : row + self.grid, col : col + self.grid] = 255 if mean_depth > THRESH and stddev < 50 else 0
+                mean_depth = np.mean(cell)
+                # Note: Compute depth variance to spot any spurious cells changes
+                diffs = [ np.min(pair[1][row : row + self.grid, col : col + self.grid]) for pair in self.history ]
+                stddev = np.std(diffs)#np.sqrt(np.sum([ (diff - mean_depth) ** 2 for diff in diffs ])) / len(diffs)
 
-        return mask, copy.deepcopy(depth_map)
+                #depths = [ estimate_depth(pair[0][row : row + self.grid, col : col + self.grid]) for pair in self.history ]
+                #max_depth = np.max(depths)
+
+                print(f'{mean_depth} +- {stddev}')
+
+                if mean_depth > THRESH and stddev < 20 and stddev > 5:
+                    mask[row : row + self.grid, col : col + self.grid] = 255
+                else:
+                    self.no_motion_count += 1
+                    if self.no_motion_count > NOMOTIONTHRESH:
+                        self.background[row : row + self.grid, col : col + self.grid] = depth_map[row : row + self.grid, col : col + self.grid]
+                        self.no_motion_count = 0
+
+        return absdiff, copy.deepcopy(depth_map)
 
 if __name__ == '__main__':
     print("Start")
